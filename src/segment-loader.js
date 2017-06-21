@@ -10,6 +10,7 @@ import removeCuesFromTrack from
   'videojs-contrib-media-sources/es5/remove-cues-from-track.js';
 import { initSegmentId } from './bin-utils';
 import {mediaSegmentRequest, REQUEST_ERRORS} from './media-segment-request';
+import { TIME_FUDGE_FACTOR } from './ranges';
 
 // in ms
 const CHECK_BUFFER_DELAY = 500;
@@ -577,6 +578,10 @@ export default class SegmentLoader extends videojs.EventTarget {
   checkBuffer_(buffered, playlist, mediaIndex, hasPlayed, currentTime, syncPoint) {
     let lastBufferedEnd = 0;
     let startOfSegment;
+    const initial = Config.GOAL_BUFFER_LENGTH;
+    const rate = Config.GOAL_BUFFER_RATE;
+    const max = Config.MAX_GOAL_BUFFER_LENGTH;
+    const dynamicGBL = Math.min(initial + currentTime * rate, Math.max(initial, max));
 
     if (buffered.length) {
       lastBufferedEnd = buffered.end(buffered.length - 1);
@@ -590,7 +595,7 @@ export default class SegmentLoader extends videojs.EventTarget {
 
     // if there is plenty of content buffered, and the video has
     // been played before relax for awhile
-    if (bufferedTime >= Config.GOAL_BUFFER_LENGTH) {
+    if (bufferedTime >= dynamicGBL) {
       return null;
     }
 
@@ -724,6 +729,113 @@ export default class SegmentLoader extends videojs.EventTarget {
     };
   }
 
+  abortRequestEarly_(stats) {
+    if (this.hls_.tech_.paused() ||
+        // Don't abort if the current playlist is on the lowestEnabledRendition
+        // TODO: Replace using timeout with a boolean indicating whether this playlist is
+        //       the lowestEnabledRendition.
+        !this.xhrOptions_.timeout ||
+        // Don't abort if we have no bandwidth information to estimate segment sizes
+        !(this.playlist_.attributes && this.playlist_.attributes.BANDWIDTH)) {
+      return false;
+    }
+
+    // Wait at least 1 second since the first byte of data has been received before
+    // using the calculated bandwidth from the progress event to allow the bitrate
+    // to stabilize
+    if (Date.now() - (stats.firstByteRoundTripTime || Date.now()) < 1000) {
+      return false;
+    }
+
+    const currentTime = this.currentTime_();
+    const measuredBandwidth = stats.bandwidth;
+    const segmentDuration = this.pendingSegment_.duration;
+    const estimatedSegmentSize =
+      segmentDuration * this.playlist_.attributes.BANDWIDTH;
+    const requestTimeRemaining =
+      (estimatedSegmentSize - (stats.bytesReceived * 8)) / measuredBandwidth;
+    const buffered = this.buffered_();
+    const bufferedEnd = buffered.length ? buffered.end(buffered.length - 1) : 0;
+    // Subtract 1 from the timeUntilRebuffer so we still consider an early abort
+    // if we are only left with less than 1 second when the request completes.
+    const timeUntilRebuffer =
+      ((bufferedEnd - currentTime) / this.hls_.tech_.playbackRate()) - 1;
+
+    // Only consider aborting early if the estimated time to finish the download
+    // is larger than the estimated time until the player runs out of forward buffer
+    if (requestTimeRemaining <= timeUntilRebuffer) {
+      return false;
+    }
+
+    const switchCandidate = this.hls_.playlists.master.playlists.filter(
+      (playlist) => playlist.attributes && playlist.attributes.BANDWIDTH
+    ).map((playlist) => {
+      const syncPoint = this.syncController_.getSyncPoint(playlist,
+                                                          this.duration_(),
+                                                          this.currentTimeline_,
+                                                          currentTime);
+      // There is no sync point for this playlist, so switching to it will require a
+      // sync request first. This will double the round trip time
+      const numRequests = syncPoint ? 1 : 2;
+      const segmentSize = segmentDuration * playlist.attributes.BANDWIDTH;
+      const roundTripTime = segmentSize * numRequests / measuredBandwidth;
+
+      return {
+        playlist,
+        roundTripTime
+      };
+    }).sort((a, b) => {
+      if (a.roundTripTime <= timeUntilRebuffer && b.roundTripTime <= timeUntilRebuffer) {
+        // if both playlists will prevent rebuffering, prioritize highest bandwidth
+        return b.playlist.attributes.BANDWIDTH - a.playlist.attributes.BANDWIDTH;
+      }
+
+      return a.roundTripTime - b.roundTripTime;
+    })[0];
+
+    if (!switchCandidate) {
+      return;
+    }
+
+    const timeSavedBySwitching = requestTimeRemaining - switchCandidate.roundTripTime;
+
+    let minimumTimeSaving = 0.5;
+
+    // If we are already rebuffering, increase the amount of variance we add to the
+    // potential round trip time of the new request so that we are not too aggressive
+    // with switching to a playlist that might save us a fraction of a second.
+    if (timeUntilRebuffer <= TIME_FUDGE_FACTOR) {
+      minimumTimeSaving = 1;
+    }
+
+    if (!switchCandidate.playlist ||
+        switchCandidate.playlist.uri === this.playlist_.uri ||
+        timeSavedBySwitching < minimumTimeSaving) {
+      return false;
+    }
+
+    // set the bandwidth to that of the desired playlist
+    // (Being sure to scale by BANDWIDTH_VARIANCE and add one so the
+    // playlist selector does not exclude it)
+    this.bandwidth =
+      switchCandidate.playlist.attributes.BANDWIDTH * Config.BANDWIDTH_VARIANCE + 1;
+    this.abort();
+    this.trigger('bandwidthupdate');
+    return true;
+  }
+
+  handleProgress_(event, segment) {
+    if (!this.pendingSegment_ || segment.requestId !== this.pendingSegment_.requestId) {
+      return;
+    }
+
+    if (this.abortRequestEarly_(segment.stats)) {
+      return;
+    }
+
+    this.trigger('progress');
+  }
+
   /**
    * load a specific segment from a request into the buffer
    *
@@ -739,14 +851,7 @@ export default class SegmentLoader extends videojs.EventTarget {
       this.decrypter_,
       this.createSimplifiedSegmentObj_(segmentInfo),
       // progress callback
-      (event, segment) => {
-        if (!this.pendingSegment_ ||
-            segment.requestId !== this.pendingSegment_.requestId) {
-          return;
-        }
-        // TODO: Use progress-based bandwidth to early abort low-bandwidth situations
-        this.trigger('progress');
-      },
+      this.handleProgress_.bind(this),
       this.segmentRequestFinished_.bind(this));
   }
 
@@ -776,7 +881,7 @@ export default class SegmentLoader extends videojs.EventTarget {
         seekable.start(0) < currentTime) {
       removeToTime = seekable.start(0);
     } else {
-      removeToTime = currentTime - 60;
+      removeToTime = currentTime - 30;
     }
 
     if (removeToTime > 0) {
