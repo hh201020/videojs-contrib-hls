@@ -47,6 +47,64 @@ const detectEndOfStream = function(playlist, mediaSource, segmentIndex) {
 
 const finite = (num) => typeof num === 'number' && isFinite(num);
 
+export const illegalMediaSwitch = (loaderType, startingMedia, newSegmentMedia) => {
+  // Although these checks should most likely cover non 'main' types, for now it narrows
+  // the scope of our checks.
+  if (loaderType !== 'main' || !startingMedia || !newSegmentMedia) {
+    return null;
+  }
+
+  if (!newSegmentMedia.containsAudio && !newSegmentMedia.containsVideo) {
+    return 'Neither audio nor video found in segment.';
+  }
+
+  if (startingMedia.containsVideo && !newSegmentMedia.containsVideo) {
+    return 'Only audio found in segment when we expected video.' +
+      ' We can\'t switch to audio only from a stream that had video.' +
+      ' To get rid of this message, please add codec information to the manifest.';
+  }
+
+  if (!startingMedia.containsVideo && newSegmentMedia.containsVideo) {
+    return 'Video found in segment when we expected only audio.' +
+      ' We can\'t switch to a stream with video from an audio only stream.' +
+      ' To get rid of this message, please add codec information to the manifest.';
+  }
+
+  return null;
+};
+
+/**
+ * Calculates a time value that is safe to remove from the back buffer without interupting
+ * playback.
+ *
+ * @param {TimeRange} seekable
+ *        The current seekable range
+ * @param {Number} currentTime
+ *        The current time of the player
+ * @param {Number} targetDuration
+ *        The target duration of the current playlist
+ * @return {Number}
+ *         Time that is safe to remove from the back buffer without interupting playback
+ */
+export const safeBackBufferTrimTime = (seekable, currentTime, targetDuration) => {
+  let removeToTime;
+
+  if (seekable.length &&
+      seekable.start(0) > 0 &&
+      seekable.start(0) < currentTime) {
+    // If we have a seekable range use that as the limit for what can be removed safely
+    removeToTime = seekable.start(0);
+  } else {
+    // otherwise remove anything older than 30 seconds before the current play head
+    removeToTime = currentTime - 30;
+  }
+
+  // Don't allow removing from the buffer within target duration of current time
+  // to avoid the possibility of removing the GOP currently being played which could
+  // cause playback stalls.
+  return Math.min(removeToTime, currentTime - targetDuration);
+};
+
 /**
  * An object that manages segment loading and appending.
  *
@@ -84,6 +142,7 @@ export default class SegmentLoader extends videojs.EventTarget {
     this.mediaSource_ = settings.mediaSource;
     this.hls_ = settings.hls;
     this.loaderType_ = settings.loaderType;
+    this.startingMedia_ = void 0;
     this.segmentMetadataTrack_ = settings.segmentMetadataTrack;
     this.goalBufferLength_ = settings.goalBufferLength;
 
@@ -442,7 +501,8 @@ export default class SegmentLoader extends videojs.EventTarget {
   resetEverything() {
     this.ended_ = false;
     this.resetLoader();
-    this.remove(0, Infinity);
+    this.remove(0, this.duration_());
+    this.trigger('reseteverything');
   }
 
   /**
@@ -753,7 +813,7 @@ export default class SegmentLoader extends videojs.EventTarget {
         //       the lowestEnabledRendition.
         !this.xhrOptions_.timeout ||
         // Don't abort if we have no bandwidth information to estimate segment sizes
-        !(this.playlist_.attributes && this.playlist_.attributes.BANDWIDTH)) {
+        !(this.playlist_.attributes.BANDWIDTH)) {
       return false;
     }
 
@@ -823,10 +883,11 @@ export default class SegmentLoader extends videojs.EventTarget {
 
     // set the bandwidth to that of the desired playlist being sure to scale by
     // BANDWIDTH_VARIANCE and add one so the playlist selector does not exclude it
+    // don't trigger a bandwidthupdate as the bandwidth is artifial
     this.bandwidth =
       switchCandidate.playlist.attributes.BANDWIDTH * Config.BANDWIDTH_VARIANCE + 1;
     this.abort();
-    this.trigger('bandwidthupdate');
+    this.trigger('earlyabort');
     return true;
   }
 
@@ -877,25 +938,15 @@ export default class SegmentLoader extends videojs.EventTarget {
    * @param {Object} segmentInfo - the current segment
    */
   trimBackBuffer_(segmentInfo) {
-    const seekable = this.seekable_();
-    const currentTime = this.currentTime_();
-    let removeToTime = 0;
+    const removeToTime = safeBackBufferTrimTime(this.seekable_(),
+                                                this.currentTime_(),
+                                                this.playlist_.targetDuration || 10);
 
     // Chrome has a hard limit of 150MB of
     // buffer and a very conservative "garbage collector"
     // We manually clear out the old buffer to ensure
     // we don't trigger the QuotaExceeded error
     // on the source buffer during subsequent appends
-
-    // If we have a seekable range use that as the limit for what can be removed safely
-    // otherwise remove anything older than 30 seconds before the current play head
-    if (seekable.length &&
-        seekable.start(0) > 0 &&
-        seekable.start(0) < currentTime) {
-      removeToTime = seekable.start(0);
-    } else {
-      removeToTime = currentTime - 30;
-    }
 
     if (removeToTime > 0) {
       this.remove(0, removeToTime);
@@ -1046,12 +1097,35 @@ export default class SegmentLoader extends videojs.EventTarget {
       return;
     }
 
-    this.state = 'APPENDING';
-
     const segmentInfo = this.pendingSegment_;
     const segment = segmentInfo.segment;
+    const timingInfo = this.syncController_.probeSegmentInfo(segmentInfo);
 
-    this.syncController_.probeSegmentInfo(segmentInfo);
+    // When we have our first timing info, determine what media types this loader is
+    // dealing with. Although we're maintaining extra state, it helps to preserve the
+    // separation of segment loader from the actual source buffers.
+    if (typeof this.startingMedia_ === 'undefined' &&
+        timingInfo &&
+        // Guard against cases where we're not getting timing info at all until we are
+        // certain that all streams will provide it.
+        (timingInfo.containsAudio || timingInfo.containsVideo)) {
+      this.startingMedia_ = {
+        containsAudio: timingInfo.containsAudio,
+        containsVideo: timingInfo.containsVideo
+      };
+    }
+
+    const illegalMediaSwitchError =
+      illegalMediaSwitch(this.loaderType_, this.startingMedia_, timingInfo);
+
+    if (illegalMediaSwitchError) {
+      this.error({
+        message: illegalMediaSwitchError,
+        blacklistDuration: Infinity
+      });
+      this.trigger('error');
+      return;
+    }
 
     if (segmentInfo.isSyncRequest) {
       this.trigger('syncinfoupdate');
@@ -1066,6 +1140,17 @@ export default class SegmentLoader extends videojs.EventTarget {
       // fired when a timestamp offset is set in HLS (can also identify discontinuities)
       this.trigger('timestampoffset');
     }
+
+    const timelineMapping = this.syncController_.mappingForTimeline(segmentInfo.timeline);
+
+    if (timelineMapping !== null) {
+      this.trigger({
+        type: 'segmenttimemapping',
+        mapping: timelineMapping
+      });
+    }
+
+    this.state = 'APPENDING';
 
     // if the media initialization segment is changing, append it
     // before the content segment

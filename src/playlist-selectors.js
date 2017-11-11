@@ -1,5 +1,6 @@
 import Config from './config';
 import Playlist from './playlist';
+import { parseCodecs } from './util/codecs.js';
 
 // Utilities
 
@@ -62,11 +63,11 @@ export const comparePlaylistBandwidth = function(left, right) {
   let leftBandwidth;
   let rightBandwidth;
 
-  if (left.attributes && left.attributes.BANDWIDTH) {
+  if (left.attributes.BANDWIDTH) {
     leftBandwidth = left.attributes.BANDWIDTH;
   }
   leftBandwidth = leftBandwidth || window.Number.MAX_VALUE;
-  if (right.attributes && right.attributes.BANDWIDTH) {
+  if (right.attributes.BANDWIDTH) {
     rightBandwidth = right.attributes.BANDWIDTH;
   }
   rightBandwidth = rightBandwidth || window.Number.MAX_VALUE;
@@ -87,16 +88,14 @@ export const comparePlaylistResolution = function(left, right) {
   let leftWidth;
   let rightWidth;
 
-  if (left.attributes &&
-      left.attributes.RESOLUTION &&
+  if (left.attributes.RESOLUTION &&
       left.attributes.RESOLUTION.width) {
     leftWidth = left.attributes.RESOLUTION.width;
   }
 
   leftWidth = leftWidth || window.Number.MAX_VALUE;
 
-  if (right.attributes &&
-      right.attributes.RESOLUTION &&
+  if (right.attributes.RESOLUTION &&
       right.attributes.RESOLUTION.width) {
     rightWidth = right.attributes.RESOLUTION.width;
   }
@@ -128,18 +127,19 @@ export const comparePlaylistResolution = function(left, right) {
  * currently detected bandwidth, accounting for some amount of
  * bandwidth variance
  */
-const simpleSelector = function(master, playerBandwidth, playerWidth, playerHeight) {
+export const simpleSelector = function(master,
+                                       playerBandwidth,
+                                       playerWidth,
+                                       playerHeight) {
   // convert the playlists to an intermediary representation to make comparisons easier
   let sortedPlaylistReps = master.playlists.map((playlist) => {
     let width;
     let height;
     let bandwidth;
 
-    if (playlist.attributes) {
-      width = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.width;
-      height = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.height;
-      bandwidth = playlist.attributes.BANDWIDTH;
-    }
+    width = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.width;
+    height = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.height;
+    bandwidth = playlist.attributes.BANDWIDTH;
 
     bandwidth = bandwidth || window.Number.MAX_VALUE;
 
@@ -154,14 +154,29 @@ const simpleSelector = function(master, playerBandwidth, playerWidth, playerHeig
   stableSort(sortedPlaylistReps, (left, right) => left.bandwidth - right.bandwidth);
 
   // filter out any playlists that have been excluded due to
-  // incompatible configurations or playback errors
+  // incompatible configurations
   sortedPlaylistReps = sortedPlaylistReps.filter(
+    (rep) => !Playlist.isIncompatible(rep.playlist)
+  );
+
+  // filter out any playlists that have been disabled manually through the representations
+  // api or blacklisted temporarily due to playback errors.
+  let enabledPlaylistReps = sortedPlaylistReps.filter(
     (rep) => Playlist.isEnabled(rep.playlist)
   );
 
+  if (!enabledPlaylistReps.length) {
+    // if there are no enabled playlists, then they have all been blacklisted or disabled
+    // by the user through the representations api. In this case, ignore blacklisting and
+    // fallback to what the user wants by using playlists the user has not disabled.
+    enabledPlaylistReps = sortedPlaylistReps.filter(
+      (rep) => !Playlist.isDisabled(rep.playlist)
+    );
+  }
+
   // filter out any variant that has greater effective bitrate
   // than the current estimated bandwidth
-  let bandwidthPlaylistReps = sortedPlaylistReps.filter(
+  let bandwidthPlaylistReps = enabledPlaylistReps.filter(
     (rep) => rep.bandwidth * Config.BANDWIDTH_VARIANCE < playerBandwidth
   );
 
@@ -218,12 +233,15 @@ const simpleSelector = function(master, playerBandwidth, playerWidth, playerHeig
   }
 
   // fallback chain of variants
-  return (
+  let chosenRep = (
     resolutionPlusOneRep ||
     resolutionBestRep ||
     bandwidthBestRep ||
+    enabledPlaylistReps[0] ||
     sortedPlaylistReps[0]
-  ).playlist;
+  );
+
+  return chosenRep ? chosenRep.playlist : null;
 };
 
 // Playlist Selectors
@@ -319,8 +337,25 @@ export const minRebufferMaxBandwidthSelector = function(settings) {
     syncController
   } = settings;
 
+  // filter out any playlists that have been excluded due to
+  // incompatible configurations
+  const compatiblePlaylists = master.playlists.filter(
+    playlist => !Playlist.isIncompatible(playlist));
+
+  // filter out any playlists that have been disabled manually through the representations
+  // api or blacklisted temporarily due to playback errors.
+  let enabledPlaylists = compatiblePlaylists.filter(Playlist.isEnabled);
+
+  if (!enabledPlaylists.length) {
+    // if there are no enabled playlists, then they have all been blacklisted or disabled
+    // by the user through the representations api. In this case, ignore blacklisting and
+    // fallback to what the user wants by using playlists the user has not disabled.
+    enabledPlaylists = compatiblePlaylists.filter(
+      playlist => !Playlist.isDisabled(playlist));
+  }
+
   const bandwidthPlaylists =
-    master.playlists.filter(Playlist.hasAttribute.bind(null, 'BANDWIDTH'));
+    enabledPlaylists.filter(Playlist.hasAttribute.bind(null, 'BANDWIDTH'));
 
   const rebufferingEstimates = bandwidthPlaylists.map((playlist) => {
     const syncPoint = syncController.getSyncPoint(playlist,
@@ -355,4 +390,36 @@ export const minRebufferMaxBandwidthSelector = function(settings) {
   stableSort(rebufferingEstimates, (a, b) => a.rebufferingImpact - b.rebufferingImpact);
 
   return rebufferingEstimates[0] || null;
+};
+
+/**
+ * Chooses the appropriate media playlist, which in this case is the lowest bitrate
+ * one with video.  If no renditions with video exist, return the lowest audio rendition.
+ *
+ * Expects to be called within the context of an instance of HlsHandler
+ *
+ * @return {Object|null}
+ *         {Object} return.playlist
+ *         The lowest bitrate playlist that contains a video codec.  If no such rendition
+ *         exists pick the lowest audio rendition.
+ */
+export const lowestBitrateCompatibleVariantSelector = function() {
+  // filter out any playlists that have been excluded due to
+  // incompatible configurations or playback errors
+  const playlists = this.playlists.master.playlists.filter(Playlist.isEnabled);
+
+  // Sort ascending by bitrate
+  stableSort(playlists,
+    (a, b) => comparePlaylistBandwidth(a, b));
+
+  // Parse and assume that playlists with no video codec have no video
+  // (this is not necessarily true, although it is generally true).
+  //
+  // If an entire manifest has no valid videos everything will get filtered
+  // out.
+  const playlistsWithVideo = playlists.filter(
+    playlist => parseCodecs(playlist.attributes.CODECS).videoCodec
+  );
+
+  return playlistsWithVideo[0] || null;
 };
