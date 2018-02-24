@@ -2,6 +2,7 @@
 
 [![Build Status][travis-icon]][travis-link]
 [![Slack Status][slack-icon]][slack-link]
+[![Greenkeeper badge][greenkeeper-icon]][greenkeeper-link]
 
 
 Play back HLS with video.js, even where it's not natively supported.
@@ -54,7 +55,6 @@ Maintenance Status: Stable
 - [Hosting Considerations](#hosting-considerations)
 - [Known Issues](#known-issues)
   - [IE10 and Below](#ie10-and-below)
-  - [IE11](#ie11)
   - [Fragmented MP4 Support](#fragmented-mp4-support)
   - [Testing](#testing)
 - [Release History](#release-history)
@@ -74,7 +74,7 @@ npm install --save videojs-contrib-hls
 ```
 
 ### CDN
-Select a version of HLS from the [CDN](https://cdnjs.com/libraries/videojs-contrib-hls)
+Select a version of HLS from [cdnjs](https://cdnjs.com/libraries/videojs-contrib-hls) or [jsDelivr](https://www.jsdelivr.com/package/npm/videojs-contrib-hls)
 
 ### Releases
 Download a release of [videojs-contrib-hls](https://github.com/videojs/videojs-contrib-hls/releases)
@@ -620,12 +620,6 @@ help find a solution that would be appreciated!
 ### IE10 and Below
 As of version 5.0.0, IE10 and below are no longer supported.
 
-### IE11
-In some IE11 setups there are issues working with its native HTML
-SourceBuffers functionality. This leads to various issues, such as
-videos stopping playback with media decode errors. The known workaround
-for this issues is to force the player to use flash when running on IE11.
-
 ### Fragmented MP4 Support
 Edge has native support for HLS but only in the MPEG2-TS container. If
 you attempt to play an HLS stream with fragmented MP4 segments, Edge
@@ -668,3 +662,5 @@ npm run <command>
 [slack-link]: http://slack.videojs.com
 [travis-icon]: https://travis-ci.org/videojs/videojs-contrib-hls.svg?branch=master
 [travis-link]: https://travis-ci.org/videojs/videojs-contrib-hls
+[greenkeeper-icon]: https://badges.greenkeeper.io/videojs/videojs-contrib-hls.svg
+[greenkeeper-link]: https://greenkeeper.io/
